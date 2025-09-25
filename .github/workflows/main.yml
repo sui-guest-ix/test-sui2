@@ -1,0 +1,111 @@
+name: EC2 auto deploy via Bastion Host
+
+on:
+  pull_request:
+    branches: [ master ]
+    types: [ closed ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Public IP
+        id: ip
+        run: |
+          echo "GitHub Actionsランナーの公開IPを取得中..."
+          PUBLIC_IP=$(curl -s https://ifconfig.me)
+          echo "::notice::公開IPアドレス: $PUBLIC_IP"
+          echo "ipv4=$PUBLIC_IP" >> $GITHUB_OUTPUT
+
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Install AWS CLI
+        run: |
+          echo "AWS CLIをインストール中..."
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install --update
+          aws --version
+          echo "::notice::AWS CLIのインストールが完了しました。"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-1
+
+      - name: Write SSH Keys for Bastion and Private EC2
+        run: |
+          echo "::group::SSH秘密鍵の準備"
+          echo "SSH秘密鍵をファイルに書き込み中..."
+          mkdir -p ~/.ssh
+          echo "${{ secrets.BASTION_PRIVATE_KEY }}" > ~/.ssh/id_bastion_rsa
+          echo "${{ secrets.EC2_PRIVATE_KEY }}" > ~/.ssh/id_ec2_rsa
+          chmod 600 ~/.ssh/id_bastion_rsa
+          chmod 600 ~/.ssh/id_ec2_rsa
+          echo "::notice::SSH秘密鍵の書き込みとパーミッション設定が完了しました。"
+          echo "::endgroup::"
+          
+      - name: Authorize Security Group Ingress
+        run: |
+          echo "::group::セキュリティグループ設定"
+          echo "踏み台サーバーのセキュリティグループにSSH接続を許可するルールを追加中..."
+          aws ec2 authorize-security-group-ingress --group-id ${{ secrets.BASTION_SECURITY_GROUP_ID }} --protocol tcp --port 22 --cidr ${{ steps.ip.outputs.ipv4 }}/32
+          echo "::notice::セキュリティグループルールの追加が完了しました。適用を待機します..."
+          sleep 5
+          echo "::endgroup::"
+
+      - name: Deploy via Bastion Host
+        run: |
+          echo "::group::リモートサーバーへのデプロイを開始"
+          echo "踏み台サーバーへのSSH接続を試行中..."
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_bastion_rsa ${{ secrets.BASTION_USER_NAME }}@${{ secrets.BASTION_HOST_NAME }} "
+            echo '踏み台サーバーに接続しました。'
+            echo 'プライベートEC2へのSSH接続を試行中...'
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ec2_rsa ${{ secrets.EC2_USER_NAME }}@${{ secrets.EC2_HOST_NAME }} '
+              echo '::notice::プライベートEC2に接続しました。'
+              echo '::notice::デプロイ処理を開始します。'
+              
+              echo 'デプロイディレクトリの確認と作成...'
+              sudo mkdir -p /home/${{ secrets.EC2_USER_NAME }}/test &&
+              sudo chown -R ${{ secrets.EC2_USER_NAME }}:${{ secrets.EC2_USER_NAME }} /home/${{ secrets.EC2_USER_NAME }}/test &&
+              echo 'デプロイディレクトリの準備が完了しました。'
+              
+              echo 'GitHubホスト鍵の known_hosts への追加...'
+              ssh-keyscan github.com >> ~/.ssh/known_hosts &&
+              echo 'GitHubホスト鍵の追加が完了しました。'
+              
+              echo 'GitHub接続用の秘密鍵を書き込み中...'
+              echo \"${{ secrets.PRIVATE_KEY_FOR_GITHUB }}\" > ~/.ssh/id_github_rsa &&
+              chmod 600 ~/.ssh/id_github_rsa &&
+              echo 'GitHub接続用の秘密鍵の準備が完了しました。'
+              
+              if [ ! -d /home/${{ secrets.EC2_USER_NAME }}/test/.git ]; then
+                echo '::notice::リポジトリが検出されませんでした。git cloneを実行します。'
+                GIT_SSH_COMMAND=\"ssh -i ~/.ssh/id_github_rsa\" git clone --depth 1 git@github.com:sui-guest-ix/test-sui.git /home/${{ secrets.EC2_USER_NAME }}/test;
+              else
+                echo '::notice::リポジトリを検出しました。git pullを実行します。'
+                cd /home/${{ secrets.EC2_USER_NAME }}/test &&
+                GIT_SSH_COMMAND=\"ssh -i ~/.ssh/id_github_rsa\" git fetch --prune &&
+                git checkout master &&
+                git pull origin master;
+              fi
+              
+              echo '::notice::デプロイ処理が完了しました。'
+            '
+            echo 'プライベートEC2へのSSHセッションが正常に終了しました。'
+          "
+          echo "::notice::踏み台サーバーへのSSHセッションが正常に終了しました。"
+          echo "::endgroup::"
+
+      - name: Revoke Security Group Ingress
+        if: always()
+        run: |
+          echo "::group::セキュリティグループルールの取り消し"
+          echo "セキュリティグループからSSH接続ルールを削除中..."
+          aws ec2 revoke-security-group-ingress --group-id ${{ secrets.BASTION_SECURITY_GROUP_ID }} --protocol tcp --port 22 --cidr ${{ steps.ip.outputs.ipv4 }}/32
+          echo "::notice::セキュリティグループルールの削除が完了しました。"
+          echo "::endgroup::"
