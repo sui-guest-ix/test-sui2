@@ -35,18 +35,45 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-northeast-1
+          aws-region: ap-northeast-1Q
 
-      - name: Write SSH Keys for Bastion and Private EC2
+      # 変更点 A: 秘密鍵をファイルに書き出す処理を削除し、ssh-agentに置き換えます。
+      # 踏み台、プライベートEC2、GitHub認証の3つ全ての鍵をAgentに登録します。
+      - name: Setup SSH Agent (All Keys)
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: |
+            ${{ secrets.BASTION_PRIVATE_KEY }}
+            ${{ secrets.EC2_PRIVATE_KEY }}
+            ${{ secrets.PRIVATE_KEY_FOR_GITHUB }}
+          
+      - name: Check Agent Status
+        run: ssh-add -l
+
+      # 変更点 B: ProxyCommand を設定するための SSH Config ファイルを作成します。
+      # これが多段SSH接続の鍵となります。
+      - name: Configure SSH for Bastion Tunnel (ProxyCommand)
         run: |
-          echo "::group::SSH秘密鍵の準備"
-          echo "SSH秘密鍵をファイルに書き込み中..."
+          echo "::group::SSH Configファイルの作成"
           mkdir -p ~/.ssh
-          echo "${{ secrets.BASTION_PRIVATE_KEY }}" > ~/.ssh/id_bastion_rsa
-          echo "${{ secrets.EC2_PRIVATE_KEY }}" > ~/.ssh/id_ec2_rsa
-          chmod 600 ~/.ssh/id_bastion_rsa
-          chmod 600 ~/.ssh/id_ec2_rsa
-          echo "::notice::SSH秘密鍵の書き込みとパーミッション設定が完了しました。"
+          cat > ~/.ssh/config <<EOF
+Host bastion
+  HostName ${{ secrets.BASTION_HOST_NAME }}
+  User ${{ secrets.BASTION_USER_NAME }}
+  # Agentに鍵が登録されているためIdentityFileは不要
+  ForwardAgent yes
+  StrictHostKeyChecking no
+  
+Host private-ec2
+  HostName ${{ secrets.EC2_HOST_NAME }}
+  User ${{ secrets.EC2_USER_NAME }}
+  # 'bastion' を経由して接続する設定
+  ProxyCommand ssh bastion -W %h:%p
+  ForwardAgent yes
+  StrictHostKeyChecking no
+EOF
+          chmod 600 ~/.ssh/config
+          echo "::notice::SSH Configファイル (private-ec2 -> bastion -> Private EC2) の設定が完了しました。"
           echo "::endgroup::"
           
       - name: Authorize Security Group Ingress
@@ -58,47 +85,47 @@ jobs:
           sleep 5
           echo "::endgroup::"
 
+      # 変更点 C: 複雑な二重SSH構造を廃止し、Configで定義した 'private-ec2' への単一接続に置き換えます。
       - name: Deploy via Bastion Host
         run: |
-          echo "::group::リモートサーバーへのデプロイを開始"
-          echo "踏み台サーバーへのSSH接続を試行中..."
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_bastion_rsa ${{ secrets.BASTION_USER_NAME }}@${{ secrets.BASTION_HOST_NAME }} "
-            echo '踏み台サーバーに接続しました。'
-            echo 'プライベートEC2へのSSH接続を試行中...'
-            ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ec2_rsa ${{ secrets.EC2_USER_NAME }}@${{ secrets.EC2_HOST_NAME }} '
-              echo '::notice::プライベートEC2に接続しました。'
-              echo '::notice::デプロイ処理を開始します。'
-              
-              echo 'デプロイディレクトリの確認と作成...'
-              sudo mkdir -p /home/${{ secrets.EC2_USER_NAME }}/test &&
-              sudo chown -R ${{ secrets.EC2_USER_NAME }}:${{ secrets.EC2_USER_NAME }} /home/${{ secrets.EC2_USER_NAME }}/test &&
-              echo 'デプロイディレクトリの準備が完了しました。'
-              
-              echo 'GitHubホスト鍵の known_hosts への追加...'
-              ssh-keyscan github.com >> ~/.ssh/known_hosts &&
-              echo 'GitHubホスト鍵の追加が完了しました。'
-              
-              echo 'GitHub接続用の秘密鍵を書き込み中...'
-              echo \"${{ secrets.PRIVATE_KEY_FOR_GITHUB }}\" > ~/.ssh/id_github_rsa &&
-              chmod 600 ~/.ssh/id_github_rsa &&
-              echo 'GitHub接続用の秘密鍵の準備が完了しました。'
-              
-              if [ ! -d /home/${{ secrets.EC2_USER_NAME }}/test/.git ]; then
-                echo '::notice::リポジトリが検出されませんでした。git cloneを実行します。'
-                GIT_SSH_COMMAND=\"ssh -i ~/.ssh/id_github_rsa\" git clone --depth 1 git@github.com:sui-guest-ix/test-sui.git /home/${{ secrets.EC2_USER_NAME }}/test;
-              else
-                echo '::notice::リポジトリを検出しました。git pullを実行します。'
-                cd /home/${{ secrets.EC2_USER_NAME }}/test &&
-                GIT_SSH_COMMAND=\"ssh -i ~/.ssh/id_github_rsa\" git fetch --prune &&
-                git checkout master &&
-                git pull origin master;
-              fi
-              
-              echo '::notice::デプロイ処理が完了しました。'
-            '
-            echo 'プライベートEC2へのSSHセッションが正常に終了しました。'
+          echo "::group::プライベートEC2へのデプロイを開始"
+          echo "Configファイル経由でプライベートEC2サーバーへのSSH接続を試行中..."
+          # Configで定義したホスト名 'private-ec2' に接続します。
+          ssh private-ec2 "
+            
+            echo '::notice::プライベートEC2に接続しました。デプロイ処理を開始します。'
+            
+            # 鍵ファイルはAgent Forwarding経由で提供されるため、ファイル書き出し処理は不要です。
+            echo '::notice::Agent Forwarding経由でGitHub認証を試行します。'
+            
+            echo 'デプロイディレクトリの確認と作成...'
+            # ユーザー名を動的に使用してディレクトリを作成し、パーミッションを設定
+            sudo mkdir -p /home/${{ secrets.EC2_USER_NAME }}/test &&
+            sudo chown -R ${{ secrets.EC2_USER_NAME }}:${{ secrets.EC2_USER_NAME }} /home/${{ secrets.EC2_USER_NAME }}/test &&
+            echo 'デプロイディレクトリの準備が完了しました。'
+            
+            echo 'GitHubホスト鍵の known_hosts への追加...'
+            mkdir -p ~/.ssh &&
+            ssh-keyscan github.com >> ~/.ssh/known_hosts &&
+            echo 'GitHubホスト鍵の追加が完了しました。'
+            
+            # Git操作では、Agent Forwardingにより認証情報が提供されるため、GIT_SSH_COMMANDは不要です。
+            if [ ! -d /home/${{ secrets.EC2_USER_NAME }}/test/.git ]; then
+              echo '::notice::リポジトリが検出されませんでした。git cloneを実行します。'
+              git clone --depth 1 git@github.com:sui-guest-ix/test-sui.git /home/${{ secrets.EC2_USER_NAME }}/test;
+              echo '::notice::git clone が完了しました。'
+            else
+              echo '::notice::リポジトリを検出しました。git pullを実行します。'
+              cd /home/${{ secrets.EC2_USER_NAME }}/test &&
+              git fetch --prune &&
+              git checkout master &&
+              git pull origin master;
+              echo '::notice::git pull が完了しました。'
+            fi
+            
+            echo '::notice::デプロイ処理が完了しました。'
           "
-          echo "::notice::踏み台サーバーへのSSHセッションが正常に終了しました。"
+          echo "::notice::プライベートEC2へのSSHセッションが正常に終了しました。"
           echo "::endgroup::"
 
       - name: Revoke Security Group Ingress
