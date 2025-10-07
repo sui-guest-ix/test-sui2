@@ -1,93 +1,7 @@
 name: EC2 auto deploy via Bastion Host
 
 on:
-  pull_request:
-    branches: [ main ]
-    types: [ closed ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Get Public IP
-        id: ip
-        run: |
-          echo "GitHub Actionsランナーの公開IPを取得中..."
-          PUBLIC_IP=$(curl -s https://ifconfig.me)
-          echo "::notice::公開IPアドレス: $PUBLIC_IP"
-          echo "ipv4=$PUBLIC_IP" >> $GITHUB_OUTPUT
-
-      - name: Checkout Repository
-        uses: actions/checkout@v2
-
-      - name: Install AWS CLI
-        run: |
-          echo "AWS CLIをインストール中..."
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip
-          sudo ./aws/install --update
-          aws --version
-          echo "::notice::AWS CLIのインストールが完了しました。"
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          # AWSリージョンを指定
-          aws-region: ap-northeast-1
-
-      # 変更点 A: 秘密鍵をファイルに書き出す処理を削除し、ssh-agentに置き換えます。
-      # 踏み台、プライベートEC2、GitHub認証の3つ全ての鍵をAgentに登録します。
-      - name: Setup SSH Agent (All Keys)
-        uses: webfactory/ssh-agent@v0.9.1
-        with:
-          ssh-private-key: |
-            ${{ secrets.BASTION_PRIVATE_KEY }}
-            ${{ secrets.EC2_PRIVATE_KEY }}
-            ${{ secrets.PRIVATE_KEY_FOR_GITHUB }}
-          
-      - name: Check Agent Status
-        run: ssh-add -l
-
-      # 変更点 B: ProxyCommand を設定するための SSH Config ファイルを作成します。
-      # **修正 2 (最終確定): echo を使用してインデント問題を完全に回避します。**
-      - name: Configure SSH for Bastion Tunnel (ProxyCommand)
-        run: |
-          echo "::group::SSH Configファイルの作成"
-          mkdir -p ~/.ssh
-          
-          # echoで各行をファイルに追記します。この方法ならYAMLのインデントの影響を受けません。
-          CONFIG_FILE=~/.ssh/config
-          
-          echo "Host bastion" >> $CONFIG_FILE
-          echo "  HostName ${{ secrets.BASTION_HOST_NAME }}" >> $CONFIG_FILE
-          echo "  User ${{ secrets.BASTION_USER_NAME }}" >> $CONFIG_FILE
-          echo "  ForwardAgent yes" >> $CONFIG_FILE
-          echo "  StrictHostKeyChecking no" >> $CONFIG_FILE
-          echo "" >> $CONFIG_FILE # 改行
-          
-          echo "Host private-ec2" >> $CONFIG_FILE
-          echo "  HostName ${{ secrets.EC2_HOST_NAME }}" >> $CONFIG_FILE
-          echo "  User ${{ secrets.EC2_USER_NAME }}" >> $CONFIG_FILE
-          echo "  ProxyCommand ssh bastion -W %h:%p" >> $CONFIG_FILE
-          echo "  ForwardAgent yes" >> $CONFIG_FILE
-          echo "  StrictHostKeyChecking no" >> $CONFIG_FILE
-
-          chmod 600 $CONFIG_FILE
-          echo "::notice::SSH Configファイル (~/.ssh/config) の設定が完了しました。"
-          echo "::endgroup::"
-          
-      - name: Authorize Security Group Ingress
-        run: |
-          echo "::group::セキュリティグループ設定"
-          echo "踏み台サーバーのセキュリティグループにSSH接続を許可するルールを追加中..."
-          aws ec2 authorize-security-group-ingress --group-id ${{ secrets.BASTION_SECURITY_GROUP_ID }} --protocol tcp --port 22 --cidr ${{ steps.ip.outputs.ipv4 }}/32
-          echo "::notice::セキュリティグループルールの追加が完了しました。適用を待機します..."
-          sleep 5
-          echo "::endgroup::"
-
+# ... (略)
       # 変更点 C: 複雑な二重SSH構造を廃止し、Configで定義した 'private-ec2' への単一接続に置き換えます。
       - name: Deploy via Bastion Host
         run: |
@@ -95,6 +9,9 @@ jobs:
           echo "Configファイル経由でプライベートEC2サーバーへのSSH接続を試行中..."
           # Configで定義したホスト名 'private-ec2' に接続します。
           ssh private-ec2 "
+            
+            # --- 修正点: コマンド失敗時に即時終了し、実行コマンドを出力する設定を追加 ---
+            set -eux 
             
             echo '::notice::プライベートEC2に接続しました。デプロイ処理を開始します。'
             
@@ -112,10 +29,17 @@ jobs:
             ssh-keyscan github.com >> ~/.ssh/known_hosts &&
             echo 'GitHubホスト鍵の追加が完了しました。'
             
-            # Git操作では、Agent Forwardingにより認証情報が提供されるため、GIT_SSH_COMMANDは不要です。
+            # 修正 3: 初期クローン時、カレントディレクトリに展開するように修正します。
             if [ ! -d /home/${{ secrets.EC2_USER_NAME }}/test/.git ]; then
-              echo '::notice::リポジトリが検出されませんでした。git cloneを実行します。'
-              git clone --depth 1 git@github.com:sui-guest-ix/test-sui.git /home/${{ secrets.EC2_USER_NAME }}/test;
+              echo '::notice::リポジトリが検出されませんでした。git clone を実行します。'
+              
+              # ターゲットディレクトリに移動
+              cd /home/${{ secrets.EC2_USER_NAME }}/test;
+
+              # 確実に空にしてからクローンし、カレントディレクトリ(.)に内容を展開させる
+              rm -rf * .*;
+              git clone --depth 1 git@github.com:sui-guest-ix/test-sui.git .;
+              
               echo '::notice::git clone が完了しました。'
             else
               echo '::notice::リポジトリを検出しました。git pullを実行します。'
@@ -126,16 +50,14 @@ jobs:
               echo '::notice::git pull が完了しました。'
             fi
             
+            # 追加: デバッグ用にクローン/プル後のディレクトリ内容を表示
+            echo '::notice::デプロイディレクトリの内容を確認します:'
+            ls -al /home/${{ secrets.EC2_USER_NAME }}/test/
+            
             echo '::notice::デプロイ処理が完了しました。'
           "
           echo "::notice::プライベートEC2へのSSHセッションが正常に終了しました。"
           echo "::endgroup::"
 
       - name: Revoke Security Group Ingress
-        if: always()
-        run: |
-          echo "::group::セキュリティグループルールの取り消し"
-          echo "セキュリティグループからSSH接続ルールを削除中..."
-          aws ec2 revoke-security-group-ingress --group-id ${{ secrets.BASTION_SECURITY_GROUP_ID }} --protocol tcp --port 22 --cidr ${{ steps.ip.outputs.ipv4 }}/32
-          echo "::notice::セキュリティグループルールの削除が完了しました。"
-          echo "::endgroup::"
+# ... (略)
