@@ -35,7 +35,8 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-northeast-1Q
+          # AWSリージョンを指定
+          aws-region: ap-northeast-1
 
       # 変更点 A: 秘密鍵をファイルに書き出す処理を削除し、ssh-agentに置き換えます。
       # 踏み台、プライベートEC2、GitHub認証の3つ全ての鍵をAgentに登録します。
@@ -51,29 +52,31 @@ jobs:
         run: ssh-add -l
 
       # 変更点 B: ProxyCommand を設定するための SSH Config ファイルを作成します。
-      # これが多段SSH接続の鍵となります。
+      # **修正 2 (最終確定): echo を使用してインデント問題を完全に回避します。**
       - name: Configure SSH for Bastion Tunnel (ProxyCommand)
         run: |
           echo "::group::SSH Configファイルの作成"
           mkdir -p ~/.ssh
-          cat > ~/.ssh/config <<EOF
-Host bastion
-  HostName ${{ secrets.BASTION_HOST_NAME }}
-  User ${{ secrets.BASTION_USER_NAME }}
-  # Agentに鍵が登録されているためIdentityFileは不要
-  ForwardAgent yes
-  StrictHostKeyChecking no
-  
-Host private-ec2
-  HostName ${{ secrets.EC2_HOST_NAME }}
-  User ${{ secrets.EC2_USER_NAME }}
-  # 'bastion' を経由して接続する設定
-  ProxyCommand ssh bastion -W %h:%p
-  ForwardAgent yes
-  StrictHostKeyChecking no
-EOF
-          chmod 600 ~/.ssh/config
-          echo "::notice::SSH Configファイル (private-ec2 -> bastion -> Private EC2) の設定が完了しました。"
+          
+          # echoで各行をファイルに追記します。この方法ならYAMLのインデントの影響を受けません。
+          CONFIG_FILE=~/.ssh/config
+          
+          echo "Host bastion" >> $CONFIG_FILE
+          echo "  HostName ${{ secrets.BASTION_HOST_NAME }}" >> $CONFIG_FILE
+          echo "  User ${{ secrets.BASTION_USER_NAME }}" >> $CONFIG_FILE
+          echo "  ForwardAgent yes" >> $CONFIG_FILE
+          echo "  StrictHostKeyChecking no" >> $CONFIG_FILE
+          echo "" >> $CONFIG_FILE # 改行
+          
+          echo "Host private-ec2" >> $CONFIG_FILE
+          echo "  HostName ${{ secrets.EC2_HOST_NAME }}" >> $CONFIG_FILE
+          echo "  User ${{ secrets.EC2_USER_NAME }}" >> $CONFIG_FILE
+          echo "  ProxyCommand ssh bastion -W %h:%p" >> $CONFIG_FILE
+          echo "  ForwardAgent yes" >> $CONFIG_FILE
+          echo "  StrictHostKeyChecking no" >> $CONFIG_FILE
+
+          chmod 600 $CONFIG_FILE
+          echo "::notice::SSH Configファイル (~/.ssh/config) の設定が完了しました。"
           echo "::endgroup::"
           
       - name: Authorize Security Group Ingress
