@@ -125,7 +125,7 @@ jobs:
               # 確実に空にしてからクローンし、カレントディレクトリ(.)に内容を展開させる
               # rm -rf * .* は、Gitが失敗した場合に残る可能性のあるファイルや隠しファイル(.DS_Storeなど)を削除します
               rm -rf * .*; 
-              git clone --depth 1 git@github.com:sui-guest-ix/test-sui.git .;
+              git clone --depth 1 git@github.com:sui-guest-ix/test-sui2.git .;
               
               echo '::notice::git clone が完了しました。'
             else
