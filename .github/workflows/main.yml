@@ -132,8 +132,8 @@ jobs:
               echo '::notice::リポジトリを検出しました。git pullを実行します。'
               cd /home/${{ secrets.EC2_USER_NAME }}/test &&
               git fetch --prune &&
-              git checkout master &&
-              git pull origin master;
+              git checkout main &&
+              git pull origin main;
               echo '::notice::git pull が完了しました。'
             fi
             
